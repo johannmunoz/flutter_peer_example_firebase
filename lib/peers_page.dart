@@ -3,6 +3,7 @@ import 'dart:math';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_webrtc/webrtc.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class PeersPage extends StatefulWidget {
@@ -14,6 +15,37 @@ class _PeersPageState extends State<PeersPage> {
   final Firestore _db = Firestore.instance;
   String userName = '';
   List<String> activeUsers = [];
+  RTCPeerConnection pc;
+  MediaStream _localStream;
+
+  Map<String, dynamic> _iceServers = {
+    'iceServers': [
+      {'url': 'stun:stun.l.google.com:19302'},
+      /*
+       * turn server configuration example.
+      {
+        'url': 'turn:123.45.67.89:3478',
+        'username': 'change_to_real_user',
+        'credential': 'change_to_real_secret'
+      },
+       */
+    ]
+  };
+
+  final Map<String, dynamic> _config = {
+    'mandatory': {},
+    'optional': [
+      {'DtlsSrtpKeyAgreement': true},
+    ],
+  };
+
+  final Map<String, dynamic> _constraints = {
+    'mandatory': {
+      'OfferToReceiveAudio': true,
+      'OfferToReceiveVideo': true,
+    },
+    'optional': [],
+  };
   @override
   void initState() {
     _setUserName();
@@ -29,6 +61,15 @@ class _PeersPageState extends State<PeersPage> {
       appBar: AppBar(
         title: Text('Active Users'),
       ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: () {
+          pc.close();
+          _localStream.dispose();
+        },
+        child: Icon(
+          Icons.clear,
+        ),
+      ),
       body: ListView.builder(
         itemCount: activeUsers.length,
         itemBuilder: (context, index) => ListTile(
@@ -37,6 +78,7 @@ class _PeersPageState extends State<PeersPage> {
             icon: Icon(Icons.video_call),
             onPressed: () {
               print('calling => ${activeUsers[index]}');
+              _makeOnCallListener(activeUsers[index]);
             },
           ),
         ),
@@ -86,27 +128,92 @@ class _PeersPageState extends State<PeersPage> {
   }
 
   void _subscribeToRecieveCall() async {
-    await _db.collection('client-signal').document(userName).delete();
-    _db
-        .collection('client-signal')
-        .document(userName)
-        .snapshots()
-        .listen((event) {});
-  }
+    final doc = await _db.collection('client-signal').document(userName).get();
 
-  void _makeOnCallListener(String userId) {}
-
-  void invite(String peer_id, String media, use_screen) {
-    if (this.onStateChange != null) {
-      this.onStateChange(SignalingState.CallStateNew);
+    if (doc.exists) {
+      await _db.collection('client-signal').document(userName).delete();
     }
-
-    _createPeerConnection(peer_id, media, use_screen).then((pc) {
-      _peerConnections[peer_id] = pc;
-      if (media == 'data') {
-        _createDataChannel(peer_id, pc);
-      }
-      _createOffer(peer_id, pc, media);
-    });
+    _db.collection('client-signal').document(userName).snapshots().listen(
+      (event) {
+        final data = event.data;
+        print(data);
+      },
+    );
   }
+
+  void _makeOnCallListener(String userId) async {
+    _localStream = await createStream();
+    pc = await createPeerConnection(_iceServers, _config);
+    pc.addStream(_localStream);
+    pc.onSignalingState = (val) {
+      print('val: $val');
+    };
+    pc.onIceGatheringState = (val) {
+      print('val: $val');
+    };
+    pc.onIceConnectionState = (val) {
+      print('val: $val');
+    };
+    pc.onAddStream = (val) {
+      print('val: $val');
+    };
+    pc.onRemoveStream = (val) {
+      print('val: $val');
+    };
+    pc.onDataChannel = (val) {
+      print('val: $val');
+    };
+    pc.onRenegotiationNeeded = () {
+      print('onRenegotiationNeeded');
+    };
+    pc.onIceCandidate = (candidate) {
+      print('candidate: $candidate');
+      _sendSignal(candidate, userId);
+    };
+    RTCSessionDescription rtcSession = await pc.createOffer(_constraints);
+    pc.setLocalDescription(rtcSession);
+    pc.createDataChannel(label, dataChannelDict)
+
+    print('rtc session: $rtcSession');
+  }
+
+  Future<MediaStream> createStream() async {
+    final Map<String, dynamic> mediaConstraints = {
+      'audio': true,
+      'video': {
+        'mandatory': {
+          'minWidth':
+              '640', // Provide your own width, height and frame rate here
+          'minHeight': '480',
+          'minFrameRate': '30',
+        },
+        'facingMode': 'user',
+        'optional': [],
+      }
+    };
+
+    MediaStream stream = await navigator.getUserMedia(mediaConstraints);
+
+    return stream;
+  }
+
+  _sendSignal(signalObj, String userId) {
+    _db.collection('client-signal').document(userId).setData(
+      {'data': signalObj, 'senderId': userName},
+    );
+  }
+
+  // void invite(String peer_id, String media, use_screen) {
+  //   if (this.onStateChange != null) {
+  //     this.onStateChange(SignalingState.CallStateNew);
+  //   }
+
+  //   _createPeerConnection(peer_id, media, use_screen).then((pc) {
+  //     _peerConnections[peer_id] = pc;
+  //     if (media == 'data') {
+  //       _createDataChannel(peer_id, pc);
+  //     }
+  //     _createOffer(peer_id, pc, media);
+  //   });
+  // }
 }
