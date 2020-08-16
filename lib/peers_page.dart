@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -51,7 +52,7 @@ class _PeersPageState extends State<PeersPage> {
     _setUserName();
     _registerChannel();
     _subscribeToUsers();
-    _subscribeToRecieveCall();
+    // _subscribeToRecieveCall();
     super.initState();
   }
 
@@ -88,7 +89,7 @@ class _PeersPageState extends State<PeersPage> {
 
   void _registerChannel() async {
     _refreshUser();
-    Timer.periodic(Duration(seconds: 10), (_) => _refreshUser());
+    Timer.periodic(Duration(seconds: 60), (_) => _refreshUser());
   }
 
   _setUserName() async {
@@ -104,6 +105,7 @@ class _PeersPageState extends State<PeersPage> {
     setState(() {
       userName = userId;
     });
+    _subscribeToRecieveCall();
   }
 
   _refreshUser() async {
@@ -121,6 +123,7 @@ class _PeersPageState extends State<PeersPage> {
   void _subscribeToUsers() {
     _db.collection('active-users').snapshots().listen((event) {
       final users = event.documents.map((e) => e.documentID).toList();
+      users.removeWhere((u) => u == userName);
       setState(() {
         activeUsers = users;
       });
@@ -128,6 +131,7 @@ class _PeersPageState extends State<PeersPage> {
   }
 
   void _subscribeToRecieveCall() async {
+    if (userName == null || userName.isEmpty) return;
     final doc = await _db.collection('client-signal').document(userName).get();
 
     if (doc.exists) {
@@ -172,7 +176,7 @@ class _PeersPageState extends State<PeersPage> {
     };
     RTCSessionDescription rtcSession = await pc.createOffer(_constraints);
     pc.setLocalDescription(rtcSession);
-    pc.createDataChannel(label, dataChannelDict)
+    // pc.createDataChannel(label, dataChannelDict)
 
     print('rtc session: $rtcSession');
   }
@@ -197,10 +201,14 @@ class _PeersPageState extends State<PeersPage> {
     return stream;
   }
 
-  _sendSignal(signalObj, String userId) {
-    _db.collection('client-signal').document(userId).setData(
-      {'data': signalObj, 'senderId': userName},
-    );
+  _sendSignal(RTCIceCandidate signalObj, String userId) {
+    try {
+      _db.collection('client-signal').document(userId).setData(
+        {'data': signalObj.toMap(), 'senderId': userName},
+      );
+    } catch (e) {
+      print(e);
+    }
   }
 
   // void invite(String peer_id, String media, use_screen) {
