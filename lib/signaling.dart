@@ -1,5 +1,5 @@
-import 'dart:convert';
 import 'dart:async';
+import 'package:flutter_peer_example_firebase/firestore_handler.dart';
 import 'package:flutter_webrtc/webrtc.dart';
 
 enum SignalingState {
@@ -24,15 +24,13 @@ typedef void DataChannelMessageCallback(
 typedef void DataChannelCallback(RTCDataChannel dc);
 
 class Signaling {
-  JsonEncoder _encoder = new JsonEncoder();
-  JsonDecoder _decoder = new JsonDecoder();
-  var _sessionId;
-  var _host;
-  var _port = 8086;
-  var _peerConnections = new Map<String, RTCPeerConnection>();
-  var _dataChannels = new Map<String, RTCDataChannel>();
+  String _selfId;
+  FirestoreHandler _socket;
+  String _sessionId;
+  Map<String, RTCPeerConnection> _peerConnections =
+      new Map<String, RTCPeerConnection>();
+  Map<String, RTCDataChannel> _dataChannels = new Map<String, RTCDataChannel>();
   var _remoteCandidates = [];
-  var _turnCredential;
 
   MediaStream _localStream;
   List<MediaStream> _remoteStreams;
@@ -43,6 +41,7 @@ class Signaling {
   OtherEventCallback onPeersUpdate;
   DataChannelMessageCallback onDataChannelMessage;
   DataChannelCallback onDataChannel;
+  // String _userId;
 
   Map<String, dynamic> _iceServers = {
     'iceServers': [
@@ -73,15 +72,7 @@ class Signaling {
     'optional': [],
   };
 
-  final Map<String, dynamic> _dc_constraints = {
-    'mandatory': {
-      'OfferToReceiveAudio': false,
-      'OfferToReceiveVideo': false,
-    },
-    'optional': [],
-  };
-
-  Signaling(this._host);
+  Signaling(this._selfId);
 
   close() {
     if (_localStream != null) {
@@ -100,23 +91,28 @@ class Signaling {
     }
   }
 
-  void invite(String peer_id, String media, use_screen) {
+  void invite(String peerId) {
+    this._sessionId = this._selfId + '-' + peerId;
+
     if (this.onStateChange != null) {
       this.onStateChange(SignalingState.CallStateNew);
     }
 
-    _createPeerConnection(peer_id, media, use_screen).then((pc) {
-      _peerConnections[peer_id] = pc;
-      if (media == 'data') {
-        _createDataChannel(peer_id, pc);
-      }
-      _createOffer(peer_id, pc, media);
+    _createPeerConnection(peerId).then((pc) {
+      _peerConnections[peerId] = pc;
+      _createOffer(peerId, pc);
     });
   }
 
   void bye() {
-    _send('bye', {
-      'session_id': this._sessionId,
+    if (this._sessionId == null) return;
+    final ids = this._sessionId.split('-');
+    if (ids.length != 2) return;
+    ids.forEach((id) {
+      _send('bye', id, {
+        'session_id': this._sessionId,
+        'from': this._selfId,
+      });
     });
   }
 
@@ -131,7 +127,7 @@ class Signaling {
           List<dynamic> peers = data;
           if (this.onPeersUpdate != null) {
             Map<String, dynamic> event = new Map<String, dynamic>();
-            // event['self'] = _selfId;
+            event['self'] = _selfId;
             event['peers'] = peers;
             this.onPeersUpdate(event);
           }
@@ -139,9 +135,8 @@ class Signaling {
         break;
       case 'offer':
         {
-          var id = data['from'];
+          var senderId = data['from'];
           var description = data['description'];
-          var media = data['media'];
           var sessionId = data['session_id'];
           this._sessionId = sessionId;
 
@@ -149,11 +144,11 @@ class Signaling {
             this.onStateChange(SignalingState.CallStateNew);
           }
 
-          var pc = await _createPeerConnection(id, media, false);
-          _peerConnections[id] = pc;
+          var pc = await _createPeerConnection(senderId);
+          _peerConnections[senderId] = pc;
           await pc.setRemoteDescription(new RTCSessionDescription(
               description['sdp'], description['type']));
-          await _createAnswer(id, pc, media);
+          await _createAnswer(senderId, pc);
           if (this._remoteCandidates.length > 0) {
             _remoteCandidates.forEach((candidate) async {
               await pc.addCandidate(candidate);
@@ -249,61 +244,33 @@ class Signaling {
     }
   }
 
-  // void connect() async {
-  //   var url = 'https://$_host:$_port/ws';
-  //   _socket = SimpleWebSocket(url);
+  void connect() async {
+    _socket = FirestoreHandler();
+    _socket.onOpen = () {
+      print('onOpen');
+      this?.onStateChange(SignalingState.ConnectionOpen);
+      // Subscribe user to active users
 
-  //   print('connect to $url');
+      _socket.subscribeUser(_selfId);
+    };
 
-  //   if (_turnCredential == null) {
-  //     try {
-  //       _turnCredential = await getTurnCredential(_host, _port);
-  //       /*{
-  //           "username": "1584195784:mbzrxpgjys",
-  //           "password": "isyl6FF6nqMTB9/ig5MrMRUXqZg",
-  //           "ttl": 86400,
-  //           "uris": ["turn:127.0.0.1:19302?transport=udp"]
-  //         }
-  //       */
-  //       _iceServers = {
-  //         'iceServers': [
-  //           {
-  //             'url': _turnCredential['uris'][0],
-  //             'username': _turnCredential['username'],
-  //             'credential': _turnCredential['password']
-  //           },
-  //         ]
-  //       };
-  //     } catch (e) {}
-  //   }
+    _socket.onMessage = (message) {
+      print('Received data: ' + message.toString());
+      // JsonDecoder decoder = new JsonDecoder();
+      this.onMessage(message);
+    };
 
-  //   _socket.onOpen = () {
-  //     print('onOpen');
-  //     this?.onStateChange(SignalingState.ConnectionOpen);
-  //     _send('new', {
-  //       'name': DeviceInfo.label,
-  //       'id': _selfId,
-  //       'user_agent': DeviceInfo.userAgent
-  //     });
-  //   };
+    _socket.onClose = (int code, String reason) {
+      print('Closed by server [$code => $reason]!');
+      if (this.onStateChange != null) {
+        this.onStateChange(SignalingState.ConnectionClosed);
+      }
+    };
 
-  //   _socket.onMessage = (message) {
-  //     print('Received data: ' + message);
-  //     JsonDecoder decoder = new JsonDecoder();
-  //     this.onMessage(decoder.convert(message));
-  //   };
+    await _socket.connect(_selfId);
+  }
 
-  //   _socket.onClose = (int code, String reason) {
-  //     print('Closed by server [$code => $reason]!');
-  //     if (this.onStateChange != null) {
-  //       this.onStateChange(SignalingState.ConnectionClosed);
-  //     }
-  //   };
-
-  //   await _socket.connect();
-  // }
-
-  Future<MediaStream> createStream(media, user_screen) async {
+  Future<MediaStream> createStream() async {
     final Map<String, dynamic> mediaConstraints = {
       'audio': true,
       'video': {
@@ -318,23 +285,21 @@ class Signaling {
       }
     };
 
-    MediaStream stream = user_screen
-        ? await navigator.getDisplayMedia(mediaConstraints)
-        : await navigator.getUserMedia(mediaConstraints);
+    MediaStream stream = await navigator.getUserMedia(mediaConstraints);
     if (this.onLocalStream != null) {
       this.onLocalStream(stream);
     }
     return stream;
   }
 
-  _createPeerConnection(id, media, user_screen) async {
-    if (media != 'data') _localStream = await createStream(media, user_screen);
+  _createPeerConnection(peerId) async {
+    _localStream = await createStream();
     RTCPeerConnection pc = await createPeerConnection(_iceServers, _config);
-    if (media != 'data') pc.addStream(_localStream);
+    pc.addStream(_localStream);
     pc.onIceCandidate = (candidate) {
-      _send('candidate', {
-        'to': id,
-        // 'from': _selfId,
+      _send('candidate', peerId, {
+        'to': peerId,
+        'from': _selfId,
         'candidate': {
           'sdpMLineIndex': candidate.sdpMlineIndex,
           'sdpMid': candidate.sdpMid,
@@ -359,7 +324,7 @@ class Signaling {
     };
 
     pc.onDataChannel = (channel) {
-      _addDataChannel(id, channel);
+      _addDataChannel(peerId, channel);
     };
 
     return pc;
@@ -376,37 +341,29 @@ class Signaling {
     if (this.onDataChannel != null) this.onDataChannel(channel);
   }
 
-  _createDataChannel(id, RTCPeerConnection pc, {label: 'fileTransfer'}) async {
-    RTCDataChannelInit dataChannelDict = new RTCDataChannelInit();
-    RTCDataChannel channel = await pc.createDataChannel(label, dataChannelDict);
-    _addDataChannel(id, channel);
-  }
-
-  _createOffer(String id, RTCPeerConnection pc, String media) async {
+  _createOffer(String peerId, RTCPeerConnection pc) async {
     try {
-      RTCSessionDescription s = await pc
-          .createOffer(media == 'data' ? _dc_constraints : _constraints);
+      RTCSessionDescription s = await pc.createOffer(_constraints);
       pc.setLocalDescription(s);
-      _send('offer', {
-        'to': id,
-        // 'from': _selfId,
+      _send('offer', peerId, {
+        'to': peerId,
+        'from': _selfId,
         'description': {'sdp': s.sdp, 'type': s.type},
         'session_id': this._sessionId,
-        'media': media,
+        'media': 'video',
       });
     } catch (e) {
       print(e.toString());
     }
   }
 
-  _createAnswer(String id, RTCPeerConnection pc, media) async {
+  _createAnswer(String senderId, RTCPeerConnection pc) async {
     try {
-      RTCSessionDescription s = await pc
-          .createAnswer(media == 'data' ? _dc_constraints : _constraints);
+      RTCSessionDescription s = await pc.createAnswer(_constraints);
       pc.setLocalDescription(s);
-      _send('answer', {
-        'to': id,
-        // 'from': _selfId,
+      _send('answer', senderId, {
+        'to': senderId,
+        'from': _selfId,
         'description': {'sdp': s.sdp, 'type': s.type},
         'session_id': this._sessionId,
       });
@@ -415,10 +372,10 @@ class Signaling {
     }
   }
 
-  _send(event, data) {
-    var request = new Map();
+  _send(String event, String peerId, data) {
+    var request = new Map<String, dynamic>();
     request["type"] = event;
     request["data"] = data;
-    // _socket.send(_encoder.convert(request));
+    _socket.send(peerId, request);
   }
 }

@@ -1,9 +1,8 @@
-import 'dart:async';
-import 'dart:convert';
 import 'dart:math';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_peer_example_firebase/signaling.dart';
 import 'package:flutter_webrtc/webrtc.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -16,41 +15,15 @@ class _PeersPageState extends State<PeersPage> {
   final Firestore _db = Firestore.instance;
   String userName = '';
   List<String> activeUsers = [];
-  RTCPeerConnection pc;
-  MediaStream _localStream;
-
-  Map<String, dynamic> _iceServers = {
-    'iceServers': [
-      {'url': 'stun:stun.l.google.com:19302'},
-      /*
-       * turn server configuration example.
-      {
-        'url': 'turn:123.45.67.89:3478',
-        'username': 'change_to_real_user',
-        'credential': 'change_to_real_secret'
-      },
-       */
-    ]
-  };
-
-  final Map<String, dynamic> _config = {
-    'mandatory': {},
-    'optional': [
-      {'DtlsSrtpKeyAgreement': true},
-    ],
-  };
-
-  final Map<String, dynamic> _constraints = {
-    'mandatory': {
-      'OfferToReceiveAudio': true,
-      'OfferToReceiveVideo': true,
-    },
-    'optional': [],
-  };
+  Signaling _signaling;
+  var _selfId;
+  RTCVideoRenderer _localRenderer = RTCVideoRenderer();
+  RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
+  bool _inCalling = false;
   @override
   void initState() {
+    initRenderers();
     _setUserName();
-    _registerChannel();
     _subscribeToUsers();
     // _subscribeToRecieveCall();
     super.initState();
@@ -60,36 +33,72 @@ class _PeersPageState extends State<PeersPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text('Active Users'),
+        title: Text('${userName ?? 'Connection...'}'),
       ),
       floatingActionButton: FloatingActionButton(
-        onPressed: () {
-          pc.close();
-          _localStream.dispose();
-        },
+        onPressed: _hangUp,
         child: Icon(
           Icons.clear,
         ),
       ),
-      body: ListView.builder(
-        itemCount: activeUsers.length,
-        itemBuilder: (context, index) => ListTile(
-          title: Text(activeUsers[index]),
-          trailing: IconButton(
-            icon: Icon(Icons.video_call),
-            onPressed: () {
-              print('calling => ${activeUsers[index]}');
-              _makeOnCallListener(activeUsers[index]);
-            },
-          ),
-        ),
-      ),
+      body: _inCalling
+          ? OrientationBuilder(builder: (context, orientation) {
+              return Container(
+                child: Stack(children: <Widget>[
+                  Positioned(
+                      left: 0.0,
+                      right: 0.0,
+                      top: 0.0,
+                      bottom: 0.0,
+                      child: Container(
+                        margin: EdgeInsets.fromLTRB(0.0, 0.0, 0.0, 0.0),
+                        width: MediaQuery.of(context).size.width,
+                        height: MediaQuery.of(context).size.height,
+                        child: RTCVideoView(_remoteRenderer),
+                        decoration: BoxDecoration(color: Colors.black54),
+                      )),
+                  Positioned(
+                    left: 20.0,
+                    top: 20.0,
+                    child: Container(
+                      width: orientation == Orientation.portrait ? 90.0 : 120.0,
+                      height:
+                          orientation == Orientation.portrait ? 120.0 : 90.0,
+                      child: RTCVideoView(_localRenderer),
+                      decoration: BoxDecoration(color: Colors.black54),
+                    ),
+                  ),
+                ]),
+              );
+            })
+          : ListView.builder(
+              itemCount: activeUsers.length,
+              itemBuilder: (context, index) => ListTile(
+                title: Text(activeUsers[index]),
+                trailing: IconButton(
+                  icon: Icon(Icons.video_call),
+                  onPressed: () {
+                    print('calling => ${activeUsers[index]}');
+                    _invitePeer(activeUsers[index]);
+                    // _makeOnCallListener(activeUsers[index]);
+                  },
+                ),
+              ),
+            ),
     );
   }
 
-  void _registerChannel() async {
-    _refreshUser();
-    Timer.periodic(Duration(seconds: 60), (_) => _refreshUser());
+  @override
+  deactivate() {
+    super.deactivate();
+    if (_signaling != null) _signaling.close();
+    _localRenderer.dispose();
+    _remoteRenderer.dispose();
+  }
+
+  initRenderers() async {
+    await _localRenderer.initialize();
+    await _remoteRenderer.initialize();
   }
 
   _setUserName() async {
@@ -98,25 +107,20 @@ class _PeersPageState extends State<PeersPage> {
 
     if (userId == null) {
       final rand = Random();
-      userId = 'USER-${rand.nextInt(1000)}';
+      userId = 'USER${rand.nextInt(1000)}';
       await prefs.setString('userId', userId);
     }
 
     setState(() {
       userName = userId;
     });
-    _subscribeToRecieveCall();
+    _connect(userId);
+    // _subscribeToRecieveCall();
   }
 
-  _refreshUser() async {
-    if (userName.isNotEmpty) {
-      await _db.collection('active-users').document(userName).setData(
-        {
-          'lastActive': Timestamp.fromDate(
-            DateTime.now(),
-          ),
-        },
-      );
+  _hangUp() {
+    if (_signaling != null) {
+      _signaling.bye();
     }
   }
 
@@ -130,98 +134,59 @@ class _PeersPageState extends State<PeersPage> {
     });
   }
 
-  void _subscribeToRecieveCall() async {
-    if (userName == null || userName.isEmpty) return;
-    final doc = await _db.collection('client-signal').document(userName).get();
-
-    if (doc.exists) {
-      await _db.collection('client-signal').document(userName).delete();
-    }
-    _db.collection('client-signal').document(userName).snapshots().listen(
-      (event) {
-        final data = event.data;
-        print(data);
-      },
-    );
-  }
-
-  void _makeOnCallListener(String userId) async {
-    _localStream = await createStream();
-    pc = await createPeerConnection(_iceServers, _config);
-    pc.addStream(_localStream);
-    pc.onSignalingState = (val) {
-      print('val: $val');
-    };
-    pc.onIceGatheringState = (val) {
-      print('val: $val');
-    };
-    pc.onIceConnectionState = (val) {
-      print('val: $val');
-    };
-    pc.onAddStream = (val) {
-      print('val: $val');
-    };
-    pc.onRemoveStream = (val) {
-      print('val: $val');
-    };
-    pc.onDataChannel = (val) {
-      print('val: $val');
-    };
-    pc.onRenegotiationNeeded = () {
-      print('onRenegotiationNeeded');
-    };
-    pc.onIceCandidate = (candidate) {
-      print('candidate: $candidate');
-      _sendSignal(candidate, userId);
-    };
-    RTCSessionDescription rtcSession = await pc.createOffer(_constraints);
-    pc.setLocalDescription(rtcSession);
-    // pc.createDataChannel(label, dataChannelDict)
-
-    print('rtc session: $rtcSession');
-  }
-
-  Future<MediaStream> createStream() async {
-    final Map<String, dynamic> mediaConstraints = {
-      'audio': true,
-      'video': {
-        'mandatory': {
-          'minWidth':
-              '640', // Provide your own width, height and frame rate here
-          'minHeight': '480',
-          'minFrameRate': '30',
-        },
-        'facingMode': 'user',
-        'optional': [],
-      }
-    };
-
-    MediaStream stream = await navigator.getUserMedia(mediaConstraints);
-
-    return stream;
-  }
-
-  _sendSignal(RTCIceCandidate signalObj, String userId) {
-    try {
-      _db.collection('client-signal').document(userId).setData(
-        {'data': signalObj.toMap(), 'senderId': userName},
-      );
-    } catch (e) {
-      print(e);
+  _invitePeer(peerId) async {
+    if (_signaling != null && peerId != _selfId) {
+      _signaling.invite(peerId);
     }
   }
 
-  // void invite(String peer_id, String media, use_screen) {
-  //   if (this.onStateChange != null) {
-  //     this.onStateChange(SignalingState.CallStateNew);
-  //   }
+  void _connect(String userId) async {
+    if (_signaling == null) {
+      _signaling = Signaling(userId);
 
-  //   _createPeerConnection(peer_id, media, use_screen).then((pc) {
-  //     _peerConnections[peer_id] = pc;
-  //     if (media == 'data') {
-  //       _createDataChannel(peer_id, pc);
-  //     }
-  //     _createOffer(peer_id, pc, media);
-  //   });
-  // }
+      _signaling.onStateChange = (SignalingState state) {
+        switch (state) {
+          case SignalingState.CallStateNew:
+            this.setState(() {
+              _inCalling = true;
+            });
+            break;
+          case SignalingState.CallStateBye:
+            this.setState(() {
+              _localRenderer.srcObject = null;
+              _remoteRenderer.srcObject = null;
+              _inCalling = false;
+            });
+            break;
+          case SignalingState.CallStateInvite:
+          case SignalingState.CallStateConnected:
+          case SignalingState.CallStateRinging:
+          case SignalingState.ConnectionClosed:
+          case SignalingState.ConnectionError:
+          case SignalingState.ConnectionOpen:
+            break;
+        }
+      };
+
+      _signaling.onPeersUpdate = ((event) {
+        this.setState(() {
+          _selfId = event['self'];
+          // _peers = event['peers'];
+        });
+      });
+
+      _signaling.onLocalStream = ((stream) {
+        _localRenderer.srcObject = stream;
+      });
+
+      _signaling.onAddRemoteStream = ((stream) {
+        _remoteRenderer.srcObject = stream;
+      });
+
+      _signaling.onRemoveRemoteStream = ((stream) {
+        _remoteRenderer.srcObject = null;
+      });
+      _signaling.connect();
+    }
+  }
 }
