@@ -25,7 +25,7 @@ typedef void DataChannelCallback(RTCDataChannel dc);
 
 class Signaling {
   String _selfId;
-  FirestoreHandler _socket;
+  FirestoreHandler _fbHandler;
   String _sessionId;
   Map<String, RTCPeerConnection> _peerConnections =
       new Map<String, RTCPeerConnection>();
@@ -41,7 +41,6 @@ class Signaling {
   OtherEventCallback onPeersUpdate;
   DataChannelMessageCallback onDataChannelMessage;
   DataChannelCallback onDataChannel;
-  // String _userId;
 
   Map<String, dynamic> _iceServers = {
     'iceServers': [
@@ -66,7 +65,7 @@ class Signaling {
 
   final Map<String, dynamic> _constraints = {
     'mandatory': {
-      'OfferToReceiveAudio': false,
+      'OfferToReceiveAudio': true,
       'OfferToReceiveVideo': true,
     },
     'optional': [],
@@ -108,12 +107,23 @@ class Signaling {
     if (this._sessionId == null) return;
     final ids = this._sessionId.split('-');
     if (ids.length != 2) return;
-    ids.forEach((id) {
-      _send('bye', id, {
-        'session_id': this._sessionId,
-        'from': this._selfId,
-      });
+    _send('bye', ids.first, {
+      'session_id': this._sessionId,
+      'from': ids.first,
+      'to': ids.last,
     });
+    _send('bye', ids.last, {
+      'session_id': this._sessionId,
+      'from': ids.last,
+      'to': ids.first,
+    });
+
+    // ids.forEach((id) {
+    //   _send('bye', id, {
+    //     'session_id': this._sessionId,
+    //     'from': this._selfId,
+    //   });
+    // });
   }
 
   void onMessage(message) async {
@@ -245,29 +255,28 @@ class Signaling {
   }
 
   void connect() async {
-    _socket = FirestoreHandler();
-    _socket.onOpen = () {
+    _fbHandler = FirestoreHandler();
+    _fbHandler.onOpen = () {
       print('onOpen');
       this?.onStateChange(SignalingState.ConnectionOpen);
       // Subscribe user to active users
 
-      _socket.subscribeUser(_selfId);
+      _fbHandler.subscribeUser(_selfId);
     };
 
-    _socket.onMessage = (message) {
+    _fbHandler.onMessage = (message) {
       print('Received data: ' + message.toString());
-      // JsonDecoder decoder = new JsonDecoder();
       this.onMessage(message);
     };
 
-    _socket.onClose = (int code, String reason) {
+    _fbHandler.onClose = (int code, String reason) {
       print('Closed by server [$code => $reason]!');
       if (this.onStateChange != null) {
         this.onStateChange(SignalingState.ConnectionClosed);
       }
     };
 
-    await _socket.connect(_selfId);
+    await _fbHandler.connect(_selfId);
   }
 
   Future<MediaStream> createStream() async {
@@ -292,7 +301,7 @@ class Signaling {
     return stream;
   }
 
-  _createPeerConnection(peerId) async {
+  Future<RTCPeerConnection> _createPeerConnection(peerId) async {
     _localStream = await createStream();
     RTCPeerConnection pc = await createPeerConnection(_iceServers, _config);
     pc.addStream(_localStream);
@@ -313,7 +322,6 @@ class Signaling {
 
     pc.onAddStream = (stream) {
       if (this.onAddRemoteStream != null) this.onAddRemoteStream(stream);
-      //_remoteStreams.add(stream);
     };
 
     pc.onRemoveStream = (stream) {
@@ -376,6 +384,6 @@ class Signaling {
     var request = new Map<String, dynamic>();
     request["type"] = event;
     request["data"] = data;
-    _socket.send(peerId, request);
+    _fbHandler.send(peerId, request);
   }
 }
